@@ -148,7 +148,13 @@ impl GithubLists {
             let parent_id = karakeep.ensure_list_exists("GitHub Starred").await?;
             for list in page.viewer.lists.nodes.into_iter().flatten() {
                 let name = list.name;
-                let list_id = karakeep.ensure_child_list_exists(&name, &parent_id).await?;
+                let list_id = karakeep
+                    .ensure_tracked_child_list_exists(
+                        &name,
+                        &parent_id,
+                        &format!("github-list:{}", list.id),
+                    )
+                    .await?;
                 let mut items_after = None;
                 let mut items_seen = HashSet::new();
                 loop {
@@ -278,9 +284,9 @@ mod tests {
             .and(path("/api/v1/lists"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"lists": [
                 {"id": "all", "name": "GitHub Starred", "parentId": null},
-                {"id": "tools", "name": "Tools", "parentId": "all"},
-                {"id": "reading", "name": "Reading", "parentId": "all"},
-                {"id": "empty", "name": "Empty", "parentId": "all"},
+                {"id": "tools", "name": "Tools", "parentId": "all", "description": "karakeep-sync-source: github-list:one"},
+                {"id": "reading", "name": "Reading", "parentId": "all", "description": "karakeep-sync-source: github-list:two"},
+                {"id": "empty", "name": "Empty", "parentId": "all", "description": "karakeep-sync-source: github-list:empty"},
                 {"id": "unrelated", "name": "Tools", "parentId": null}
             ]})))
             .mount(&server)
@@ -343,7 +349,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/lists"))
             .and(body_partial_json(
-                json!({"name": "Tools", "parentId": "root"}),
+                json!({"name": "Tools", "parentId": "root", "description": "Auto-created list from karakeep-sync\nkarakeep-sync-source: github-list:one"}),
             ))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "child"})))
             .expect(1)
@@ -356,10 +362,148 @@ mod tests {
         );
         assert_eq!(
             karakeep
-                .ensure_child_list_exists("Tools", "root")
+                .ensure_tracked_child_list_exists("Tools", "root", "github-list:one")
                 .await
                 .unwrap(),
             "child"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_rename_updates_the_existing_child_and_preserves_its_description() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        use wiremock::Request;
+
+        let server = MockServer::start().await;
+        let renamed = Arc::new(AtomicBool::new(false));
+        let source = renamed.clone();
+        Mock::given(method("POST")).and(path("/graphql"))
+            .respond_with(move |request: &Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let query = body["query"].as_str().unwrap();
+                assert!(query.trim_start().starts_with("query "));
+                let data = if query == LISTS_QUERY {
+                    let name = if source.load(Ordering::SeqCst) { "New name" } else { "Old name" };
+                    json!({"viewer": {"lists": connection(json!([{"id": "stable-source-id", "name": name}]), None)}})
+                } else {
+                    json!({"node": {"items": connection(json!([{"url": "https://github.com/owner/repo", "nameWithOwner": "owner/repo"}]), None)}})
+                };
+                ResponseTemplate::new(200).set_body_json(json!({"data": data}))
+            }).mount(&server).await;
+        let child = Arc::new(Mutex::new(json!({
+            "id": "same-child-id", "name": "Old name", "parentId": "root", "description": "Personal notes"
+        })));
+        let state = child.clone();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/lists"))
+            .respond_with(move |_: &Request| {
+                ResponseTemplate::new(200).set_body_json(json!({"lists": [
+                    {"id": "root", "name": "GitHub Starred", "parentId": null},
+                    state.lock().unwrap().clone()
+                ]}))
+            })
+            .mount(&server)
+            .await;
+        let state = child.clone();
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/lists/same-child-id"))
+            .respond_with(move |request: &Request| {
+                let changes: Value = serde_json::from_slice(&request.body).unwrap();
+                let mut state = state.lock().unwrap();
+                for (key, value) in changes.as_object().unwrap() {
+                    state[key] = value.clone();
+                }
+                ResponseTemplate::new(200).set_body_json(state.clone())
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks/search"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"bookmarks": [
+                    {"id": "same-bookmark-id", "content": {"url": "https://github.com/owner/repo"}}
+                ]})),
+            )
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/api/v1/lists/same-child-id/bookmarks/same-bookmark-id",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(3)
+            .mount(&server)
+            .await;
+        for endpoint in ["/api/v1/lists", "/api/v1/bookmarks"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let github = GithubLists::new("test-token", &format!("{}/graphql", server.uri())).unwrap();
+        let karakeep = KarakeepClient::new(&server.uri(), "test-token");
+        github.sync(&karakeep).await.unwrap();
+        renamed.store(true, Ordering::SeqCst);
+        github.sync(&karakeep).await.unwrap();
+        github.sync(&karakeep).await.unwrap();
+        let state = child.lock().unwrap();
+        assert_eq!(state["id"], "same-child-id");
+        assert_eq!(state["name"], "New name");
+        assert_eq!(
+            state["description"],
+            "Personal notes\nkarakeep-sync-source: github-list:stable-source-id"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_adopt_a_same_named_child_bound_to_a_different_source() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/v1/lists"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"lists": [
+                {"id": "unrelated", "name": "Tools", "parentId": "root", "description": "karakeep-sync-source: github-list:other"}
+            ]}))).mount(&server).await;
+        Mock::given(method("POST")).and(path("/api/v1/lists"))
+            .and(body_partial_json(json!({"name": "Tools", "parentId": "root", "description": "Auto-created list from karakeep-sync\nkarakeep-sync-source: github-list:new"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "new-child"})))
+            .expect(1).mount(&server).await;
+        let karakeep = KarakeepClient::new(&server.uri(), "test-token");
+        assert_eq!(
+            karakeep
+                .ensure_tracked_child_list_exists("Tools", "root", "github-list:new")
+                .await
+                .unwrap(),
+            "new-child"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_ambiguous_source_bindings() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/v1/lists"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"lists": [
+                {"id": "one", "name": "One", "parentId": "root", "description": "karakeep-sync-source: github-list:same"},
+                {"id": "two", "name": "Two", "parentId": "root", "description": "karakeep-sync-source: github-list:same"}
+            ]}))).mount(&server).await;
+        let karakeep = KarakeepClient::new(&server.uri(), "test-token");
+        assert!(
+            karakeep
+                .ensure_tracked_child_list_exists("New name", "root", "github-list:same")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Multiple Karakeep lists")
         );
     }
 

@@ -80,9 +80,11 @@ GitHub stars will be synced to a list named `GitHub Starred` in your Karakeep in
 
 Set `KS_GITHUB_SYNCLISTS=true` to also import the authenticated user's GitHub star lists through the GraphQL API. Each source list becomes a child of `GitHub Starred`, using its original name. Bookmarks also remain directly in `GitHub Starred`. A repository can belong to multiple child lists.
 
-List imports paginate every source list and its repositories on each run. They reuse existing bookmarks by URL and add memberships even when the flat import stops after five existing bookmarks. This also distributes stars imported before the option was enabled. Existing child lists with the same name and parent are reused. Lists elsewhere in Karakeep are not reused or moved.
+List imports paginate every source list and its repositories on each run. They reuse existing bookmarks by URL and add memberships even when the flat import stops after five existing bookmarks. This also distributes stars imported before the option was enabled. On first import, an untracked child with the same name and parent is reused. Lists elsewhere in Karakeep are not reused or moved.
 
-List imports are additive. They do not delete bookmarks, remove memberships, or modify GitHub. Renamed source lists create new destination lists and leave the old destination lists intact. Only lists and repositories visible to the token can be imported. The token must support these GraphQL queries, not just the REST stars endpoint. HTTP errors and GraphQL permission errors fail the sync and appear in the logs.
+Each imported child stores its GitHub list ID in a `karakeep-sync-source: github-list:<id>` line in its description. Existing description text is preserved. Keep this metadata line so source renames update the same Karakeep child without changing its ID or memberships. Names are not used to identify a list after it is linked to GitHub.
+
+List imports are additive. They do not delete bookmarks, remove memberships, or modify GitHub. Only lists and repositories visible to the token can be imported. The token must support these GraphQL queries, not just the REST stars endpoint. HTTP errors and GraphQL permission errors fail the sync and appear in the logs.
 
 GitHub sync will be skipped if `KS_GITHUB_TOKEN` is not set.
 
