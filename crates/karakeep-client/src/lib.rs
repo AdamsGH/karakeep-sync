@@ -120,6 +120,23 @@ impl KarakeepClient {
     }
 
     pub async fn ensure_list_exists(&self, list_name: &str) -> anyhow::Result<String> {
+        self.ensure_list_exists_under(list_name, None).await
+    }
+
+    pub async fn ensure_child_list_exists(
+        &self,
+        list_name: &str,
+        parent_id: &str,
+    ) -> anyhow::Result<String> {
+        self.ensure_list_exists_under(list_name, Some(parent_id))
+            .await
+    }
+
+    async fn ensure_list_exists_under(
+        &self,
+        list_name: &str,
+        parent_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         let url = format!("{}/api/v1/lists", self.url);
 
         let resp = parse_response(self.client.get(&url).send().await?).await?;
@@ -128,6 +145,7 @@ impl KarakeepClient {
 
         for list in lists {
             if list.get("name").and_then(|n| n.as_str()) == Some(list_name)
+                && list.get("parentId").and_then(|p| p.as_str()) == parent_id
                 && let Some(id) = list.get("id").and_then(|id| id.as_str())
             {
                 return Ok(id.to_string());
@@ -135,11 +153,14 @@ impl KarakeepClient {
         }
 
         // If not, create it
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "name": list_name,
             "description": "Auto-created list from karakeep-sync",
             "icon": "🚀"
         });
+        if let Some(parent_id) = parent_id {
+            params["parentId"] = parent_id.into();
+        }
 
         let resp = parse_response(self.client.post(&url).json(&params).send().await?).await?;
 
@@ -160,7 +181,7 @@ impl KarakeepClient {
             "{}/api/v1/lists/{}/bookmarks/{}",
             self.url, list_id, bookmark_id
         );
-        let _resp = self.client.put(&url).send().await?;
+        self.client.put(&url).send().await?.error_for_status()?;
 
         Ok(())
     }
